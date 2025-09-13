@@ -1,0 +1,205 @@
+(function () {
+  if (window.__autoDepositRunning) {
+    console.warn('[autoDeposit] 已在运行，调用 window.autoDepositStop() 停止。');
+    return;
+  }
+
+  // 全局状态
+  window.__autoDepositRunning = true;
+  window.__depositCount = window.__depositCount || 0;
+
+  // 停止函数
+  window.autoDepositStop = function () {
+    window.__autoDepositRunning = false;
+    console.log('[autoDeposit] 停止请求已发送');
+  };
+
+  const log = (...args) => console.log('[autoDeposit]', ...args);
+
+  // 简单延迟
+  const delay = ms => new Promise(res => setTimeout(res, ms));
+
+  // 等待函数（带停止检查）
+  function waitFor(fn, { interval = 300, timeout = 30000, description = '' } = {}) {
+    const start = Date.now();
+    return new Promise((resolve, reject) => {
+      (async function poll() {
+        if (!window.__autoDepositRunning) return reject(new Error('stopped-by-user'));
+        try {
+          const r = fn();
+          if (r) return resolve(r);
+        } catch (e) {}
+        if (Date.now() - start >= timeout) return reject(new Error('timeout waiting for ' + description));
+        await delay(interval);
+        poll();
+      })();
+    });
+  }
+
+  // 点击元素（尽量触发 React 事件）
+  function clickEl(el) {
+    if (!el) return;
+    try {
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+    } catch (e) {}
+    ['mouseover', 'mousedown', 'mouseup', 'click'].forEach(type =>
+      el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }))
+    );
+    // fallback native click
+    try { el.click && el.click(); } catch (e) {}
+    log('clicked:', (el.innerText || el.value || el.className || el.tagName).toString().slice(0, 120));
+  }
+
+  // 找到目标输入框（尽量用 placeholder + inputmode）
+  function findAmountInput() {
+    return document.querySelector('input[placeholder="0.00"][inputmode="decimal"], input[placeholder="0.00"]');
+  }
+
+  // 强稳写入金额：多策略（native setter + inputEvent + char-by-char）
+  async function setAmountRobust(input, val = '0.001') {
+    if (!input) return;
+    input.focus && input.focus();
+
+    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+
+    // 1) 清空
+    try {
+      nativeSetter.call(input, '');
+    } catch (e) {
+      input.value = '';
+    }
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    await delay(120);
+
+    // 2) 直接一次性写入并派发 InputEvent
+    try {
+      nativeSetter.call(input, val);
+    } catch (e) {
+      input.value = val;
+    }
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, data: val, inputType: 'insertFromPaste' }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    await delay(120);
+
+    // 3) 如果未生效，再用逐字符输入（更能触发框架监听）
+    if ((input.value || '') !== val) {
+      try { nativeSetter.call(input, ''); } catch (e) { input.value = ''; }
+      for (const ch of val.split('')) {
+        try {
+          nativeSetter.call(input, (input.value || '') + ch);
+        } catch (e) {
+          input.value = (input.value || '') + ch;
+        }
+        input.dispatchEvent(new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        await delay(70);
+      }
+    }
+
+    // ensure blur to trigger onBlur handlers
+    try { input.blur && input.blur(); } catch (e) {}
+    await delay(80);
+
+    log('amount set ->', input.value);
+  }
+
+  // 找 Deposit 按钮（可见且可点击）
+  function findDepositBtn() {
+    return Array.from(document.querySelectorAll('button'))
+      .find(b => {
+        const txt = (b.innerText || '').trim();
+        if (!/deposit/i.test(txt)) return false;
+        if (b.disabled) return false;
+        if (b.offsetParent === null) return false;
+        const st = getComputedStyle(b);
+        if (st.pointerEvents === 'none' || st.visibility === 'hidden' || st.display === 'none') return false;
+        return true;
+      }) || null;
+  }
+
+  // 可选：如果出现 Confirm / Approve 的二次确认按钮，自动点击
+  async function clickOptionalConfirm(timeout = 3000) {
+    const start = Date.now();
+    while (Date.now() - start < timeout && window.__autoDepositRunning) {
+      const confirmBtn = Array.from(document.querySelectorAll('button')).find(b => {
+        const t = (b.innerText || '').trim().toLowerCase();
+        if (!t) return false;
+        return /^(confirm|approve|confirm deposit|approve deposit|confirm tx|confirm transaction|ok)$/i.test(t) || /confirm|approve/i.test(t);
+      });
+      if (confirmBtn && !confirmBtn.disabled && confirmBtn.offsetParent !== null) {
+        clickEl(confirmBtn);
+        log('Optional confirm clicked');
+        return true;
+      }
+      await delay(200);
+    }
+    return false;
+  }
+
+  // 找成功提示（文本包含 Deposit successful!）
+  function findDepositSuccess() {
+    // 优先查找包含该精确文本的元素；若没有，尝试更宽松的匹配
+    const exact = Array.from(document.querySelectorAll('*')).find(el => (el.textContent || '').trim().includes('Deposit successful!'));
+    if (exact) return exact;
+    const loose = Array.from(document.querySelectorAll('*')).find(el => /deposit successful/i.test(el.textContent || ''));
+    return loose || null;
+  }
+
+  // 主循环
+  (async function mainLoop() {
+    log('脚本启动 — 调用 window.autoDepositStop() 停止。');
+    let round = 0;
+
+    while (window.__autoDepositRunning) {
+      round++;
+      log(`--- 第 ${round} 轮开始 ---`);
+
+      try {
+        // 1) 等输入框出现并写入金额（robust）
+        const input = await waitFor(findAmountInput, { interval: 300, timeout: 10000, description: '金额输入框' });
+        await setAmountRobust(input, '0.001');
+        await delay(150);
+
+        // 2) 等 Deposit 按钮可点击
+        const depositBtn = await waitFor(findDepositBtn, { interval: 300, timeout: 15000, description: 'Deposit按钮' });
+        clickEl(depositBtn);
+
+        // 2.5) 处理可能出现的二次确认（可选）
+        await clickOptionalConfirm(2500);
+
+        // 3) 等待成功提示
+        const successEl = await waitFor(findDepositSuccess, { interval: 400, timeout: 30000, description: 'Deposit成功提示' });
+        log('🎉 成功提示检测到 ->', (successEl.textContent || '').trim().slice(0, 200));
+
+        // 4) 计数
+        window.__depositCount = (window.__depositCount || 0) + 1;
+        log('📊 当前成功次数:', window.__depositCount);
+
+        // 5) 清空输入，为下一轮触发做准备
+        try {
+          const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+          nativeSetter.call(input, '');
+        } catch (e) {
+          input.value = '';
+        }
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        await delay(800);
+
+      } catch (err) {
+        if (err && err.message === 'stopped-by-user') {
+          log('用户停止脚本');
+          break;
+        }
+        log('⚠️ 本轮出错:', (err && err.message) || err);
+        // 等一会儿再继续下一轮
+        await delay(3000);
+      }
+    }
+
+    log('主循环退出');
+    window.__autoDepositRunning = false;
+  })();
+
+})();
